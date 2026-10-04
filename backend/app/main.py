@@ -21,6 +21,7 @@ from app.api.routes_voice import router as voice_router
 from app.api.routes_sms import router as sms_router
 from app.api.routes_map import router as map_router
 from app.api.routes_ask import router as ask_router
+from app.api.routes_operations import router as operations_router
 
 # ================= STRUCTURED LOGGING WITH PII REDACTION =================
 class SensitiveDataFilter(logging.Filter):
@@ -170,11 +171,14 @@ app.include_router(voice_router)
 app.include_router(sms_router)
 app.include_router(map_router)
 app.include_router(ask_router)
+app.include_router(operations_router)
 
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
     seed_database()
+    from app.background.sla_monitor import start_sla_monitor
+    start_sla_monitor()
 
 # ================= HEALTH CHECK ENDPOINTS (Layer 14) =================
 @app.get("/api/health/live")

@@ -19,6 +19,8 @@ from app.schemas import (
 from app.agents.complaint_routing_agent import ComplaintRoutingAgent
 from app.agents.pattern_memory_agent import PatternMemoryAgent
 from app.agents.policy_agent import PolicyAgent
+from app.operational.priority import calculate_priority
+from app.operational.sla import create_sla_instance
 
 router = APIRouter(prefix="/api/student", tags=["Student Portal"])
 routing_agent = ComplaintRoutingAgent()
@@ -173,6 +175,45 @@ def create_complaint(data: ComplaintCreate, student: User = Depends(require_role
         timestamp=now
     )
     db.add(audit)
+
+    # Create OperationalCase for reliability tracking
+    from app.db.models_operational import OperationalCase, OperationalAuditEvent
+
+    op_priority = calculate_priority(
+        service_type="MAINTENANCE",
+        domain="HOSTEL",
+        text=f"{data.title} {data.description}",
+        context={}
+    )
+
+    oc = OperationalCase(
+        domain="HOSTEL",
+        service_type="MAINTENANCE",
+        requester_id=student.id,
+        current_owner_id=staff_assignee.id if staff_assignee else None,
+        owning_role="MAINTENANCE_STAFF",
+        priority=op_priority,
+        status="SUBMITTED",
+        estimated_affected=1,
+        linked_entity_type="Complaint",
+        linked_entity_id=new_complaint.id,
+        created_at=now
+    )
+    db.add(oc)
+    db.flush()
+
+    sla = create_sla_instance(db, oc)
+    if sla:
+        db.add(sla)
+
+    oc_audit = OperationalAuditEvent(
+        operational_case_id=oc.id,
+        event_type="CREATED",
+        actor_id=student.id,
+        new_value="SUBMITTED",
+        reason="Complaint operational case created"
+    )
+    db.add(oc_audit)
     db.commit()
 
     # Check pattern memory agent
@@ -243,7 +284,6 @@ def get_gate_passes(student: User = Depends(require_role("STUDENT")), db: Sessio
 @router.post("/requests/gatepass", response_model=GatePassResponse)
 def request_gate_pass(data: GatePassCreate, student: User = Depends(require_role("STUDENT")), db: Session = Depends(get_db)):
     now = datetime.datetime.utcnow()
-    # Pull required approver chain from canonical policy configuration (PolicyAgent)
     policy_res = policy_agent.run({"policy_type": "GATE_PASS", "current_status": "PENDING"})
     chain = policy_res.output.get("approval_chain", [])
 
@@ -258,6 +298,52 @@ def request_gate_pass(data: GatePassCreate, student: User = Depends(require_role
         created_at=now
     )
     db.add(new_gp)
+    db.flush()
+
+    # Determine context for priority — student at gate or future request?
+    context = {}
+    departure_delta = (data.departure_time - now).total_seconds() / 60
+    if departure_delta < 60:
+        context["student_at_gate"] = True
+
+    op_priority = calculate_priority(
+        service_type="GATE_PASS",
+        domain="SAFETY",
+        text=f"{data.reason} to {data.destination}",
+        context=context
+    )
+
+    faculty = db.query(User).filter(User.role == "STAFF").first()
+
+    from app.db.models_operational import OperationalCase, OperationalAuditEvent
+    oc = OperationalCase(
+        domain="SAFETY",
+        service_type="GATE_PASS",
+        requester_id=student.id,
+        current_owner_id=faculty.id if faculty else None,
+        owning_role="FACULTY",
+        priority=op_priority,
+        status="SUBMITTED",
+        estimated_affected=1,
+        linked_entity_type="GatePass",
+        linked_entity_id=new_gp.id,
+        created_at=now
+    )
+    db.add(oc)
+    db.flush()
+
+    sla = create_sla_instance(db, oc)
+    if sla:
+        db.add(sla)
+
+    oc_audit = OperationalAuditEvent(
+        operational_case_id=oc.id,
+        event_type="CREATED",
+        actor_id=student.id,
+        new_value="SUBMITTED",
+        reason="Gate pass operational case created"
+    )
+    db.add(oc_audit)
     db.commit()
     db.refresh(new_gp)
 
@@ -392,3 +478,120 @@ def mark_notice_read(notice_id: int, student: User = Depends(require_role("STUDE
         receipt.read_at = now
     db.commit()
     return {"status": "success", "notice_id": notice_id, "read_at": now.isoformat()}
+
+
+@router.post("/verify-case/{operational_case_id}")
+def verify_case(
+    operational_case_id: int,
+    confirmed: bool,
+    student: User = Depends(require_role("STUDENT")),
+    db: Session = Depends(get_db)
+):
+    from app.db.models_operational import OperationalCase, OperationalAuditEvent, SLAInstance
+
+    oc = db.query(OperationalCase).filter(
+        OperationalCase.id == operational_case_id,
+        OperationalCase.requester_id == student.id
+    ).first()
+    if not oc:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    now = datetime.datetime.utcnow()
+    if confirmed:
+        oc.status = "RESOLVED"
+        oc.resolved_at = now
+        oc.verified_at = now
+
+        sla = db.query(SLAInstance).filter(
+            SLAInstance.operational_case_id == oc.id
+        ).first()
+        if sla:
+            sla.resolved_at = now
+            sla.sla_state = "MET"
+
+        reason = "Student confirmed resolution"
+    else:
+        oc.status = "REOPENED"
+        oc.reopen_count += 1
+        reason = "Student disputed resolution - problem persists"
+
+    audit = OperationalAuditEvent(
+        operational_case_id=oc.id,
+        event_type="STUDENT_VERIFICATION",
+        actor_id=student.id,
+        new_value=oc.status,
+        reason=reason
+    )
+    db.add(audit)
+    db.commit()
+
+    return {"status": "success", "case_id": operational_case_id, "new_status": oc.status}
+
+
+@router.get("/my-cases")
+def get_my_cases(
+    student: User = Depends(require_role("STUDENT")),
+    db: Session = Depends(get_db)
+):
+    from app.db.models_operational import OperationalCase, SLAInstance
+    from app.operational.sla import compute_sla_state
+
+    cases = db.query(OperationalCase).filter(
+        OperationalCase.requester_id == student.id
+    ).order_by(desc(OperationalCase.created_at)).limit(50).all()
+
+    results = []
+    for case in cases:
+        sla = db.query(SLAInstance).filter(
+            SLAInstance.operational_case_id == case.id
+        ).first()
+        sla_state = None
+        if sla:
+            sla_state = compute_sla_state(sla, datetime.datetime.utcnow())
+
+        results.append({
+            "id": case.id,
+            "domain": case.domain,
+            "service_type": case.service_type,
+            "priority": case.priority,
+            "status": case.status,
+            "sla_state": sla_state,
+            "created_at": case.created_at.isoformat() if case.created_at else None,
+            "resolved_at": case.resolved_at.isoformat() if case.resolved_at else None,
+            "linked_entity_type": case.linked_entity_type,
+            "linked_entity_id": case.linked_entity_id,
+            "student_follow_up_count": case.student_follow_up_count,
+        })
+    return results
+
+
+@router.post("/cases/{operational_case_id}/follow-up")
+def follow_up_case(
+    operational_case_id: int,
+    note: Optional[str] = None,
+    student: User = Depends(require_role("STUDENT")),
+    db: Session = Depends(get_db)
+):
+    from app.db.models_operational import OperationalCase, OperationalAuditEvent
+
+    oc = db.query(OperationalCase).filter(
+        OperationalCase.id == operational_case_id,
+        OperationalCase.requester_id == student.id
+    ).first()
+    if not oc:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    oc.student_follow_up_count += 1
+
+    audit = OperationalAuditEvent(
+        operational_case_id=oc.id,
+        event_type="STUDENT_FOLLOW_UP",
+        actor_id=student.id,
+        old_value=str(oc.student_follow_up_count - 1),
+        new_value=str(oc.student_follow_up_count),
+        reason=note or "Student follow-up"
+    )
+    db.add(audit)
+    db.commit()
+
+    return {"status": "success", "case_id": operational_case_id, "follow_up_count": oc.student_follow_up_count}

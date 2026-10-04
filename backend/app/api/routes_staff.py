@@ -37,9 +37,10 @@ def get_staff_dashboard(staff: User = Depends(require_role("STAFF", "ADMIN")), d
 
 @router.get("/tickets", response_model=List[ComplaintResponse])
 def get_assigned_tickets(staff: User = Depends(require_role("STAFF", "ADMIN")), db: Session = Depends(get_db)):
-    # Show tickets assigned to this staff member or all hostel tickets if warden
     query = db.query(Complaint)
-    if staff.hostel:
+    if staff.role == "ADMIN":
+        pass
+    elif staff.hostel:
         query = query.filter((Complaint.assigned_to == staff.id) | (Complaint.place == staff.hostel))
     else:
         query = query.filter(Complaint.assigned_to == staff.id)
@@ -91,24 +92,63 @@ def update_ticket_status(
         raise HTTPException(status_code=404, detail="Complaint not found")
 
     prev_status = complaint.status
-    complaint.status = data.status.upper()
+    new_status = data.status.upper()
+    complaint.status = new_status
     now = datetime.datetime.utcnow()
 
-    if data.status.upper() == "RESOLVED":
+    if new_status == "RESOLVED":
         complaint.resolved_at = now
     if data.assigned_to:
         complaint.assigned_to = data.assigned_to
 
     audit = ComplaintAuditTrail(
         complaint_id=complaint.id,
-        action=f"STATUS_UPDATED_TO_{data.status.upper()}",
+        action=f"STATUS_UPDATED_TO_{new_status}",
         performed_by=staff.id,
         previous_status=prev_status,
-        new_status=data.status.upper(),
+        new_status=new_status,
         note=data.note or f"Status transitioned by {staff.name}",
         timestamp=now
     )
     db.add(audit)
+
+    # Sync OperationalCase status
+    from app.db.models_operational import OperationalCase, OperationalAuditEvent, SLAInstance
+    oc = db.query(OperationalCase).filter(
+        OperationalCase.linked_entity_type == "Complaint",
+        OperationalCase.linked_entity_id == complaint_id
+    ).first()
+
+    if oc:
+        status_map = {
+            "ASSIGNED": "ASSIGNED",
+            "IN_PROGRESS": "IN_PROGRESS",
+            "RESOLVED": "WORK_COMPLETED",
+        }
+        oc_status = status_map.get(new_status, new_status)
+        oc.status = oc_status
+        if new_status == "RESOLVED":
+            oc.resolved_at = now
+        if data.assigned_to:
+            oc.current_owner_id = data.assigned_to
+
+        sla = db.query(SLAInstance).filter(
+            SLAInstance.operational_case_id == oc.id
+        ).first()
+        if sla and new_status == "RESOLVED":
+            sla.resolved_at = now
+            sla.sla_state = "MET"
+
+        oc_audit = OperationalAuditEvent(
+            operational_case_id=oc.id,
+            event_type=f"COMPLAINT_STATUS_{new_status}",
+            actor_id=staff.id,
+            old_value=prev_status,
+            new_value=oc_status,
+            reason=data.note or f"Staff {staff.name} updated status"
+        )
+        db.add(oc_audit)
+
     db.commit()
 
     return {"status": "success", "complaint_id": complaint.id, "new_status": complaint.status}
@@ -238,3 +278,60 @@ def act_on_gatepass(
     db.commit()
 
     return {"status": "success", "gatepass_id": gp.id, "new_status": gp.status}
+
+
+@router.post("/tickets/{complaint_id}/request-verification")
+def request_verification(
+    complaint_id: int,
+    note: Optional[str] = "Work completed. Please confirm resolution.",
+    staff: User = Depends(require_role("STAFF", "ADMIN")),
+    db: Session = Depends(get_db)
+):
+    complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
+    if not complaint:
+        raise HTTPException(status_code=404, detail="Complaint not found")
+
+    prev_status = complaint.status
+    now = datetime.datetime.utcnow()
+    complaint.status = "RESOLVED"
+    complaint.resolved_at = now
+
+    audit = ComplaintAuditTrail(
+        complaint_id=complaint.id,
+        action="WORK_COMPLETED_VERIFICATION_REQUESTED",
+        performed_by=staff.id,
+        previous_status=prev_status,
+        new_status="RESOLVED",
+        note=note,
+        timestamp=now
+    )
+    db.add(audit)
+
+    from app.db.models_operational import OperationalCase, OperationalAuditEvent, SLAInstance
+    oc = db.query(OperationalCase).filter(
+        OperationalCase.linked_entity_type == "Complaint",
+        OperationalCase.linked_entity_id == complaint_id
+    ).first()
+
+    if oc:
+        oc.status = "VERIFICATION_PENDING"
+        oc.completed_at = now
+
+        sla = db.query(SLAInstance).filter(
+            SLAInstance.operational_case_id == oc.id
+        ).first()
+        if sla:
+            sla.resolved_at = now
+
+        oc_audit = OperationalAuditEvent(
+            operational_case_id=oc.id,
+            event_type="VERIFICATION_REQUESTED",
+            actor_id=staff.id,
+            old_value="IN_PROGRESS",
+            new_value="VERIFICATION_PENDING",
+            reason=note
+        )
+        db.add(oc_audit)
+
+    db.commit()
+    return {"status": "success", "complaint_id": complaint_id}

@@ -131,6 +131,39 @@ def get_admin_analytics(admin: User = Depends(require_role("ADMIN")), db: Sessio
     total_notices = db.query(Notice).count()
     pending_certificates = db.query(CertificateRequest).filter(CertificateRequest.status != "COLLECTED").count()
 
+    # Operational metrics
+    from app.db.models_operational import OperationalCase, SLAInstance
+    from app.operational.metrics import calculate_campus_pulse, calculate_slo_compliance, calculate_zero_chase_compliance
+    from app.operational.sla import compute_sla_state
+
+    total_cases = db.query(OperationalCase).count()
+    at_risk_cases = 0
+    breached_cases = 0
+    open_cases = db.query(OperationalCase).filter(
+        OperationalCase.status.notin_(["RESOLVED", "CLOSED", "CANCELLED"])
+    ).all()
+
+    for case in open_cases:
+        sla = db.query(SLAInstance).filter(
+            SLAInstance.operational_case_id == case.id
+        ).first()
+        if sla:
+            state = compute_sla_state(sla, now)
+            if state == "AT_RISK":
+                at_risk_cases += 1
+            elif state == "BREACHED":
+                breached_cases += 1
+
+    operational = {
+        "total_cases": total_cases,
+        "open_cases": len(open_cases),
+        "at_risk": at_risk_cases,
+        "breached": breached_cases,
+        "slo_compliance_pct": calculate_slo_compliance(db),
+        "zero_chase_compliance_pct": calculate_zero_chase_compliance(db),
+        "campus_pulse": calculate_campus_pulse(db)
+    }
+
     return {
         "summary": {
             "total_open_tickets": len(open_complaints),
@@ -143,7 +176,8 @@ def get_admin_analytics(admin: User = Depends(require_role("ADMIN")), db: Sessio
         "ageing_heatmap": ageing,
         "resolution_trends": avg_resolution_by_category,
         "staff_workload": staff_workload,
-        "recurring_alerts": recurring_alerts
+        "recurring_alerts": recurring_alerts,
+        "operational": operational
     }
 
 @router.post("/incidents/merge")
@@ -183,6 +217,10 @@ def list_incidents(admin: User = Depends(require_role("ADMIN")), db: Session = D
     incidents = db.query(Incident).order_by(desc(Incident.created_at)).all()
     results = []
     for inc in incidents:
+        from app.db.models_incident import IncidentMember
+        member_count = db.query(IncidentMember).filter(
+            IncidentMember.incident_id == inc.id
+        ).count()
         results.append({
             "id": inc.id,
             "title": inc.title,
@@ -190,6 +228,9 @@ def list_incidents(admin: User = Depends(require_role("ADMIN")), db: Session = D
             "place": inc.place,
             "description": inc.description,
             "status": inc.status,
+            "severity": inc.severity,
+            "affected_population": inc.affected_population or 0,
+            "member_count": member_count,
             "created_at": inc.created_at,
             "complaint_count": len(inc.complaints)
         })

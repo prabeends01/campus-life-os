@@ -65,10 +65,19 @@ class Incident(Base):
     category = Column(String(50), nullable=False)
     place = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
-    status = Column(String(20), default="INVESTIGATING") # INVESTIGATING, RESOLVING, RESOLVED
+    status = Column(String(20), default="INVESTIGATING")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    severity = Column(String(5), nullable=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    affected_population = Column(Integer, default=0)
+    service = Column(String(50), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    next_update = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    operational_case_id = Column(Integer, nullable=True)
 
     complaints = relationship("Complaint", back_populates="incident")
+    owner = relationship("User", foreign_keys=[owner_id])
 
 
 class ComplaintAuditTrail(Base):

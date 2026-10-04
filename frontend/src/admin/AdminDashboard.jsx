@@ -917,8 +917,13 @@ export default function AdminDashboard({ onSwitchToStudent }) {
                           <h4 style={{ fontSize: '15px', fontWeight: 700, color: 'var(--color-ink)', marginTop: '2px' }}>
                             {t.title}
                           </h4>
-                          <div style={{ fontSize: '12px', color: 'var(--color-neutral-mid)', marginTop: '2px' }}>
-                            Priority: {t.priority} · SLA: 12h
+                          <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '4px' }}>
+                            <span className={`status-pill ${t.priority === 'CRITICAL' ? 'red' : t.priority === 'HIGH' ? 'amber' : 'blue'}`}>
+                              {t.priority}
+                            </span>
+                            <span style={{ fontSize: '11px', color: 'var(--color-neutral-mid)' }}>
+                              SLA: 12h
+                            </span>
                           </div>
                         </div>
 
